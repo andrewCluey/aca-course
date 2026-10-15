@@ -2,7 +2,7 @@ terraform {
   required_providers {
     azurerm = {
       source  = "hashicorp/azurerm"
-      version = "3.72.0"
+      version = "~> 5.0"
     }
   }
 }
@@ -13,7 +13,7 @@ provider "azurerm" {
 
 resource "azurerm_resource_group" "rg" {
   name     = "rg-aca-job-event-trigger"
-  location = "westeurope"
+  location = "uksouth"
 }
 
 resource "azurerm_container_app_environment" "aca_environment" {
@@ -23,53 +23,81 @@ resource "azurerm_container_app_environment" "aca_environment" {
 }
 
 resource "azurerm_servicebus_namespace" "service-bus" {
-  name                          = "service-bus-namespace-13579"
+  name                          = "service-bus-namespace-1222"
   location                      = azurerm_resource_group.rg.location
   resource_group_name           = azurerm_resource_group.rg.name
   sku                           = "Standard"
   capacity                      = 0
-  zone_redundant                = false
   public_network_access_enabled = true
 }
 
 resource "azurerm_servicebus_queue" "queue-messages" {
   name                = "queue-messages"
   namespace_id        = azurerm_servicebus_namespace.service-bus.id
-  enable_partitioning = false
+  partitioning_enabled = false
   lock_duration       = "PT5M" # amount of time that the message is locked for other receivers, 1 min, max 5 min
   max_delivery_count  = 1
 }
 
-resource "terraform_data" "deploy_job" {
-  triggers_replace = {
-    when = timestamp()
-  }
-  provisioner "local-exec" {
+# assign rights for the ACA Job Managed identity to access Service Bus Queue
+# Give the managed identity the RBAC role to receive messages from the queue
+resource "azurerm_role_assignment" "role-receiver-queue-identity" {
+  scope                = azurerm_servicebus_queue.queue-messages.id
+  role_definition_name = "Azure Service Bus Data Receiver"
+  principal_id         = azurerm_container_app_job.job.identity[0].principal_id
+}
 
-    when        = create
-    interpreter = ["PowerShell", "-Command"]
-    command     = <<-EOT
-      az containerapp job create `
-        --name aca-job-keda `
-        --resource-group ${azurerm_resource_group.rg.name} `
-        --environment ${azurerm_container_app_environment.aca_environment.name} `
-        --replica-timeout 600 `
-        --replica-retry-limit 1 `
-        --replica-completion-count 1 `
-        --parallelism 1 `
-        --image "mcr.microsoft.com/k8se/quickstart-jobs:latest" `
-        --cpu "0.25" `
-        --memory "0.5Gi" `
-        --min-executions 0 `
-        --max-executions 1 `
-        --trigger-type "Event" `
-        --secrets service-bus-connection-string="${azurerm_servicebus_namespace.service-bus.default_primary_connection_string}" `
-        --scale-rule-name azure-servicebus-queue-rule `
-        --scale-rule-type azure-servicebus `
-        --scale-rule-auth "connection=service-bus-connection-string" `
-        --scale-rule-metadata "namespace=${azurerm_servicebus_namespace.service-bus.name}" `
-                              "queueName=${azurerm_servicebus_queue.queue-messages.name}" `
-                              "messageCount=1"
-      EOT
+# Give the managed identity the RBAC role to send messages to the queue
+resource "azurerm_role_assignment" "role-sender-queue-identity" {
+  scope                = azurerm_servicebus_queue.queue-messages.id
+  role_definition_name = "Azure Service Bus Data Sender"
+  principal_id         = azurerm_container_app_job.job.identity[0].principal_id
+}
+
+# Azurerm v5, fully supports ACA jobs and managed identity auth for Keda.
+resource "azurerm_container_app_job" "job" {
+  name                         = "aca-job-keda"
+  location                     = azurerm_resource_group.rg.location
+  resource_group_name          = azurerm_resource_group.rg.name
+  container_app_environment_id = azurerm_container_app_environment.aca_environment.id
+  replica_timeout_in_seconds   = 600
+  replica_retry_limit          = 1
+
+  identity {
+    type = "SystemAssigned"
+  }
+
+  event_trigger_config {
+    replica_completion_count = 1
+    parallelism              = 1
+    
+    scale {
+      min_executions = 0
+      max_executions = 1
+      
+      rules {
+        name             = "azure-servicebus-queue-rule"
+        custom_rule_type = "azure-servicebus"
+        
+        # While not documented in Terraform provider docs, it is valid.
+        identity_id = "System"
+        
+        metadata = {
+          queueName    = azurerm_servicebus_queue.queue-messages.name
+          namespace    = azurerm_servicebus_namespace.service-bus.name
+          messageCount = "1"
+        }
+      }
+    }
+  }
+
+  template {
+    container {
+      image  = "mcr.microsoft.com/k8se/quickstart-jobs:latest"
+      name   = "aca-job-demo"
+      cpu    = 0.5
+      memory = "1Gi"
+    }
   }
 }
+
