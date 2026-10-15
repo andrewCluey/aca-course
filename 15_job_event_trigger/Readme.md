@@ -60,33 +60,36 @@ Then you will watch for a triggered Job.
 
 >Note that, many jobs will be triggered, non stop. That is because we have configured the Job to run when there is a message within the Queue. And because the message you created is never consumed/received/completed, it will always trigger new Jobs.
 
-Check the `scale-rule` used to configure how KEDA will autoscale the Job.
+Check the `event_trigger_config` in the `azurerm_container_app_job` terraform resource to configure how KEDA will autoscale the Job.
 
 ```bash
-      az containerapp job create `
-        --name aca-job-demo `
-        --resource-group ${azurerm_resource_group.rg.name} `
-        --environment ${azurerm_container_app_environment.aca_environment.name} `
-        --replica-timeout 600 `
-        --replica-retry-limit 1 `
-        --replica-completion-count 1 `
-        --parallelism 1 `
-        --image "mcr.microsoft.com/k8se/quickstart-jobs:latest" `
-        --cpu "0.25" `
-        --memory "0.5Gi" `
-        --min-executions 0 `
-        --max-executions 1 `
-        --trigger-type "Event" `
-        --secrets service-bus-connection-string="${azurerm_servicebus_namespace.service-bus.default_primary_connection_string}" `
-        --scale-rule-name azure-servicebus-queue-rule `
-        --scale-rule-type azure-servicebus `
-        --scale-rule-auth "connection=service-bus-connection-string" `
-        --scale-rule-metadata "namespace=${azurerm_servicebus_namespace.service-bus.name}" `
-                              "queueName=${azurerm_servicebus_queue.queue-messages.name}" `
-                              "messageCount=1"
+...
+event_trigger_config {
+    replica_completion_count = 1
+    parallelism              = 1
+    
+    scale {
+      min_executions = 0
+      max_executions = 1
+      
+      rules {
+        name             = "azure-servicebus-queue-rule"
+        custom_rule_type = "azure-servicebus"
+        
+        # While not documented in Terraform provider docs, it is valid.
+        identity_id = "System"
+        
+        metadata = {
+          queueName    = azurerm_servicebus_queue.queue-messages.name
+          namespace    = azurerm_servicebus_namespace.service-bus.name
+          messageCount = "1"
+        }
+      }
+    }
+  }
 ```
 
-The autoscaler needs to authenticate to Azure Service Bus to count the number of messages. For that it uses the Service Bus Connection String, namespace and Queue name.
+The autoscaler needs to authenticate to Azure Service Bus to count the number of messages. For that it uses the Container Apps Managed Identity, namespace and Queue name.
 Note how this configuration will trigger a new Job each time you have at least one message within the Queue ("messageCount=1").
 
 ## Conclusion
